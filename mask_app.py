@@ -199,7 +199,7 @@ class PromptGUI(object):
 
         out_frames, self.color_masks_all = colorize_masks(images, self.index_masks_all)
         out_vidpath = "tracked_colors.mp4"
-        iio.mimwrite(out_vidpath, out_frames)
+        # iio.mimwrite(out_vidpath, out_frames)
         message = f"Wrote current tracked video to {out_vidpath}."
         instruct = "Save the masks to an output directory if it looks good!"
         return out_vidpath, f"{message} {instruct}"
@@ -209,10 +209,17 @@ class PromptGUI(object):
         os.makedirs(output_dir, exist_ok=True)
         for img_path, clr_mask, id_mask in zip(self.img_paths, self.color_masks_all, self.index_masks_all):
             name = os.path.basename(img_path)
-            out_path = f"{output_dir}/{name}"
-            iio.imwrite(out_path, clr_mask)
-            np_out_path = f"{output_dir}/{name[:-4]}.npy"
-            np.save(np_out_path, id_mask)
+            # Mask names should be image_i.jpg.png
+            out_path = f"{output_dir}/{name}.png"
+
+            # Convert mask to grayscale
+            gray_mask = np.any(clr_mask != 0, axis=-1).astype(np.uint8)  # 1 where mask, 0 elsewhere
+            # Invert: mask regions -> black, background -> white
+            colmap_mask = (1 - gray_mask) * 255  # white for background, black for masked regions
+            iio.imwrite(out_path, colmap_mask.astype(np.uint8))
+
+            # np_out_path = f"{output_dir}/{name[:-4]}.npy"
+            # np.save(np_out_path, id_mask)
         
         message = f"Saved masks to {output_dir}!"
         guru.debug(message)
@@ -527,8 +534,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8890)
-    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints/sam2_hiera_large.pt")
-    parser.add_argument("--model_cfg", type=str, default="sam2_hiera_l.yaml")
+    parser.add_argument("--checkpoint_dir", type=str, default="../checkpoints/sam2.1_hiera_large.pt")
+    parser.add_argument("--model_cfg", type=str, default="configs/sam2.1/sam2.1_hiera_l.yaml")
     parser.add_argument("--root_dir", type=str, required=True)
     parser.add_argument("--vid_name", type=str, default="videos")
     parser.add_argument("--img_name", type=str, default="images")

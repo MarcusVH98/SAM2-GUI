@@ -1,3 +1,10 @@
+# Changes made in this fork
+- Masks output changed to be compatible with [Colmap mask_path](https://colmap.github.io/faq.html#mask-image-regions) masks.
+- Skipping output of .mp4 for preview to save time.
+- Updated model from Sam2 to 2.1
+
+This repo is ment to be cloned into the root of sam2 repo to work.
+
 # GUI for SAM2
 A GUI tool for SAM2 video segmentation.
 
