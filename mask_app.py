@@ -1,8 +1,9 @@
+from pathlib import Path
 import torch
 # use bfloat16 for the entire notebook
 torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
 
-if torch.cuda.get_device_properties(0).major >= 8:
+if torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 8:
     # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -22,7 +23,6 @@ import numpy as np
 from loguru import logger as guru
 
 from sam2.build_sam import build_sam2_video_predictor
-
 
 
 class PromptGUI(object):
@@ -154,12 +154,6 @@ class PromptGUI(object):
         """
         assert self.sam_model is not None
         
-
-        if torch.cuda.get_device_properties(0).major >= 8:
-            # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-        
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             _, out_obj_ids, out_mask_logits = self.sam_model.add_new_points_or_box(
                 inference_state=self.inference_state,
@@ -181,10 +175,6 @@ class PromptGUI(object):
         images = [iio.imread(p)[:, :, :3] for p in self.img_paths]
         
         video_segments = {}  # video_segments contains the per-frame segmentation results
-        if torch.cuda.get_device_properties(0).major >= 8:
-            # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
         
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             for out_frame_idx, out_obj_ids, out_mask_logits in self.sam_model.propagate_in_video(self.inference_state, start_frame_idx=0):
@@ -206,11 +196,20 @@ class PromptGUI(object):
 
     def save_masks_to_dir(self, output_dir: str) -> str:
         assert self.color_masks_all is not None
+
+        if self.color_masks_all == []:
+            message = f"No masks to export. Did you remember to submit masks for tracking and wait for it to finish?"
+            guru.warning(message)
+            return message
+
         os.makedirs(output_dir, exist_ok=True)
+        message = f"Saving masks to {output_dir}..."
+        guru.info(message)
+
         for img_path, clr_mask, id_mask in zip(self.img_paths, self.color_masks_all, self.index_masks_all):
-            name = os.path.basename(img_path)
-            # Mask names should be image_i.jpg.png
-            out_path = f"{output_dir}/{name}.png"
+            name = Path(img_path).stem
+            # Mask name compatible with RealityCapture masks
+            out_path = f"{output_dir}/{name}.mask.png"
 
             # Convert mask to grayscale
             gray_mask = np.any(clr_mask != 0, axis=-1).astype(np.uint8)  # 1 where mask, 0 elsewhere
@@ -218,9 +217,6 @@ class PromptGUI(object):
             colmap_mask = (1 - gray_mask) * 255  # white for background, black for masked regions
             iio.imwrite(out_path, colmap_mask.astype(np.uint8))
 
-            # np_out_path = f"{output_dir}/{name[:-4]}.npy"
-            # np.save(np_out_path, id_mask)
-        
         message = f"Saved masks to {output_dir}!"
         guru.debug(message)
         return message
@@ -277,9 +273,9 @@ def compose_img_mask(img, color_mask, fac: float = 0.5):
     return out_u
 
 
-def listdir(vid_dir):
-    if vid_dir is not None and os.path.isdir(vid_dir):
-        return sorted(os.listdir(vid_dir))
+def listdir(dir):
+    if dir is not None and os.path.isdir(dir):
+        return sorted(os.listdir(dir))
     return []
 
 
@@ -289,7 +285,7 @@ def make_demo(
     root_dir,
     vid_name: str = "videos",
     img_name: str = "images",
-    mask_name: str = "masks",
+    mask_name: str = "images",
 ):
     prompts = PromptGUI(checkpoint_dir, model_cfg)
 
@@ -359,26 +355,26 @@ def make_demo(
                 )
                 save_button = gr.Button("Save masks")
 
-        def update_vid_root(root_dir, vid_name):
+        def get_vid_dirs(root_dir, vid_name):
             vid_root = f"{root_dir}/{vid_name}"
             vid_paths = listdir(vid_root)
             guru.debug(f"Updating video paths: {vid_paths=}")
             return vid_paths
 
-        def update_img_root(root_dir, img_name):
+        def get_img_dirs(root_dir, img_name):
             img_root = f"{root_dir}/{img_name}"
             img_dirs = listdir(img_root)
             guru.debug(f"Updating img dirs: {img_dirs=}")
             return img_root, img_dirs
 
-        def update_mask_dir(root_dir, mask_name, seq_name):
+        def get_mask_dir(root_dir, mask_name, seq_name):
             return f"{root_dir}/{mask_name}/{seq_name}"
 
         def update_root_paths(root_dir, vid_name, img_name, mask_name, seq_name):
             return (
-                update_vid_root(root_dir, vid_name),
-                update_img_root(root_dir, img_name),
-                update_mask_dir(root_dir, mask_name, seq_name),
+                get_vid_dirs(root_dir, vid_name),
+                get_img_dirs(root_dir, img_name),
+                get_mask_dir(root_dir, mask_name, seq_name),
             )
 
         def select_video(root_dir, vid_name, seq_file):
@@ -452,17 +448,17 @@ def make_demo(
             outputs=[vid_files_field, img_dirs_field, mask_dir_field],
         )
         vid_name_field.submit(
-            update_vid_root,
+            get_vid_dirs,
             [root_dir_field, vid_name_field],
             outputs=[vid_files_field],
         )
         img_name_field.submit(
-            update_img_root,
+            get_img_dirs,
             [root_dir_field, img_name_field],
             outputs=[img_dirs_field],
         )
         mask_name_field.submit(
-            update_mask_dir,
+            get_mask_dir,
             [root_dir_field, mask_name_field, seq_name_field],
             outputs=[mask_dir_field],
         )
@@ -481,7 +477,7 @@ def make_demo(
             [frame_index, instruction],
         )
         seq_name_field.change(
-            update_mask_dir,
+            get_mask_dir,
             [root_dir_field, mask_name_field, seq_name_field],
             outputs=[mask_dir_field],
         )
@@ -539,7 +535,7 @@ if __name__ == "__main__":
     parser.add_argument("--root_dir", type=str, required=True)
     parser.add_argument("--vid_name", type=str, default="videos")
     parser.add_argument("--img_name", type=str, default="images")
-    parser.add_argument("--mask_name", type=str, default="masks")
+    parser.add_argument("--mask_name", type=str, default="images")
     args = parser.parse_args()
 
     # device = "cuda" if torch.cuda.is_available() else "cpu"
