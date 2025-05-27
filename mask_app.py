@@ -1,5 +1,7 @@
 from pathlib import Path
+
 import torch
+
 # use bfloat16 for the entire notebook
 torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
 
@@ -19,7 +21,6 @@ import cv2
 import gradio as gr
 import imageio.v2 as iio
 import numpy as np
-
 from loguru import logger as guru
 
 from sam2.build_sam import build_sam2_video_predictor
@@ -52,15 +53,16 @@ class PromptGUI(object):
 
     def init_sam_model(self):
         if self.sam_model is None:
-            self.sam_model = build_sam2_video_predictor(self.model_cfg, self.checkpoint_dir)
+            self.sam_model = build_sam2_video_predictor(
+                self.model_cfg, self.checkpoint_dir
+            )
             guru.info(f"loaded model checkpoint {self.checkpoint_dir}")
-
 
     def clear_points(self) -> tuple[None, None, str]:
         self.selected_points.clear()
         self.selected_labels.clear()
         message = "Cleared points, select new points to update mask"
-        return None, None, message
+        return None, message
 
     def add_new_mask(self):
         self.cur_mask_idx += 1
@@ -99,7 +101,7 @@ class PromptGUI(object):
         self.img_paths = [
             f"{img_dir}/{p}" for p in sorted(os.listdir(img_dir)) if isimage(p)
         ]
-        
+
         return len(self.img_paths)
 
     def set_input_image(self, i: int = 0) -> np.ndarray | None:
@@ -138,12 +140,13 @@ class PromptGUI(object):
         self.selected_labels.append(self.cur_label_val)
         # masks, scores, logits if we want to update the mask
         masks = self.get_sam_mask(
-            frame_idx, np.array(self.selected_points, dtype=np.float32), np.array(self.selected_labels, dtype=np.int32)
+            frame_idx,
+            np.array(self.selected_points, dtype=np.float32),
+            np.array(self.selected_labels, dtype=np.int32),
         )
         mask = self.make_index_mask(masks)
 
         return mask
-    
 
     def get_sam_mask(self, frame_idx, input_points, input_labels):
         """
@@ -153,7 +156,7 @@ class PromptGUI(object):
         return (H, W) mask, (H, W) logits
         """
         assert self.sam_model is not None
-        
+
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             _, out_obj_ids, out_mask_logits = self.sam_model.add_new_points_or_box(
                 inference_state=self.inference_state,
@@ -163,63 +166,71 @@ class PromptGUI(object):
                 labels=input_labels,
             )
 
-        return  {
-                out_obj_id: (out_mask_logits[i] > 0.0).squeeze().cpu().numpy()
-                for i, out_obj_id in enumerate(out_obj_ids)
-            }
-
+        return {
+            out_obj_id: (out_mask_logits[i] > 0.0).squeeze().cpu().numpy()
+            for i, out_obj_id in enumerate(out_obj_ids)
+        }
 
     def run_tracker(self) -> tuple[str, str]:
+        """
+        After propagation, produce a list `self.color_masks_all` containing
+        one 2-D uint8 mask (0/255) for every input frame, in order.
+        """
+        video_masks = {}  # frame_idx -> 2-D uint8 mask
 
-        # read images and drop the alpha channel
-        images = [iio.imread(p)[:, :, :3] for p in self.img_paths]
-        
-        video_segments = {}  # video_segments contains the per-frame segmentation results
-        
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            for out_frame_idx, out_obj_ids, out_mask_logits in self.sam_model.propagate_in_video(self.inference_state, start_frame_idx=0):
-                masks = {
-                    out_obj_id: (out_mask_logits[i] > 0.0).squeeze().cpu().numpy()
-                    for i, out_obj_id in enumerate(out_obj_ids)
-                }
-                video_segments[out_frame_idx] = masks
-            # index_masks_all.append(self.make_index_mask(masks))
+            for frame_idx, obj_ids, mask_logits in self.sam_model.propagate_in_video(
+                self.inference_state, start_frame_idx=0
+            ):
+                # → Boolean masks for every object in this frame
+                bool_masks = [
+                    (mask_logits[i] > 0.0).squeeze().cpu().numpy()
+                    for i in range(len(obj_ids))
+                ]
 
-        self.index_masks_all = [self.make_index_mask(v) for k, v in video_segments.items()]
+                # Collapse to a single binary mask, then convert to 0/255 uint8
+                binary = np.any(bool_masks, axis=0)  # (H, W) bool
+                grayscale = (~binary).astype(np.uint8) * 255  # (H, W) uint8
 
-        out_frames, self.color_masks_all = colorize_masks(images, self.index_masks_all)
-        out_vidpath = "tracked_colors.mp4"
-        # iio.mimwrite(out_vidpath, out_frames)
-        message = f"Wrote current tracked video to {out_vidpath}."
-        instruct = "Save the masks to an output directory if it looks good!"
-        return out_vidpath, f"{message} {instruct}"
+                video_masks[frame_idx] = grayscale
+
+        # Store in chronological order
+        self.color_masks_all = [video_masks[i] for i in sorted(video_masks)]
+
+        msg = f"Created binary masks for {len(self.color_masks_all)} frames."
+        instr = "Run `save_masks_to_dir()` to write them to disk."
+        return "", f"{msg} {instr}"
 
     def save_masks_to_dir(self, output_dir: str) -> str:
-        assert self.color_masks_all is not None
+        masks = getattr(self, "color_masks_all", None)
 
-        if self.color_masks_all == []:
-            message = f"No masks to export. Did you remember to submit masks for tracking and wait for it to finish?"
-            guru.warning(message)
-            return message
+        if not masks or not isinstance(masks, list):
+            warn = "No masks to export. Did you run tracking first?"
+            guru.warning(warn)
+            return warn
+
+        # If ALL masks are empty (all zeros) bail early
+        if not any(mask.any() for mask in masks):
+            warn = "All masks are empty – nothing to save."
+            guru.warning(warn)
+            return warn
 
         os.makedirs(output_dir, exist_ok=True)
-        message = f"Saving masks to {output_dir}..."
-        guru.info(message)
+        guru.info(f"Saving masks to {output_dir}…")
 
-        for img_path, clr_mask, id_mask in zip(self.img_paths, self.color_masks_all, self.index_masks_all):
+        for img_path, mask in zip(self.img_paths, masks):
+            if mask.ndim != 2:
+                raise ValueError(f"Expected 2-D mask, got shape {mask.shape}")
+
             name = Path(img_path).stem
-            # Mask name compatible with RealityCapture masks
-            out_path = f"{output_dir}/{name}.mask.png"
+            out_path = Path(output_dir) / f"{name}.mask.png"
 
-            # Convert mask to grayscale
-            gray_mask = np.any(clr_mask != 0, axis=-1).astype(np.uint8)  # 1 where mask, 0 elsewhere
-            # Invert: mask regions -> black, background -> white
-            colmap_mask = (1 - gray_mask) * 255  # white for background, black for masked regions
-            iio.imwrite(out_path, colmap_mask.astype(np.uint8))
+            # mask is already 0/255 uint8 – write as single-channel PNG
+            iio.imwrite(out_path, mask)
 
-        message = f"Saved masks to {output_dir}!"
-        guru.debug(message)
-        return message
+        done = f"Saved {len(masks)} masks to {output_dir}!"
+        guru.debug(done)
+        return done
 
 
 def isimage(p):
@@ -349,7 +360,6 @@ def make_demo(
                 output_img = gr.Image(label="Current selection")
                 add_button = gr.Button("Add new mask")
                 submit_button = gr.Button("Submit mask for tracking")
-                final_video = gr.Video(label="Masked video")
                 mask_dir_field = gr.Text(
                     None, label="Path to save masks", interactive=False
                 )
@@ -510,14 +520,12 @@ def make_demo(
 
         sam_button.click(prompts.get_sam_features, outputs=[instruction, input_image])
         reset_button.click(prompts.reset)
-        clear_button.click(
-            prompts.clear_points, outputs=[output_img, final_video, instruction]
-        )
+        clear_button.click(prompts.clear_points, outputs=[output_img, instruction])
         pos_button.click(prompts.set_positive, outputs=[instruction])
         neg_button.click(prompts.set_negative, outputs=[instruction])
 
         add_button.click(prompts.add_new_mask, outputs=[output_img, instruction])
-        submit_button.click(prompts.run_tracker, outputs=[final_video, instruction])
+        submit_button.click(prompts.run_tracker, outputs=[instruction])
         save_button.click(
             prompts.save_masks_to_dir, [mask_dir_field], outputs=[instruction]
         )
@@ -530,8 +538,12 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8890)
-    parser.add_argument("--checkpoint_dir", type=str, default="../checkpoints/sam2.1_hiera_large.pt")
-    parser.add_argument("--model_cfg", type=str, default="configs/sam2.1/sam2.1_hiera_l.yaml")
+    parser.add_argument(
+        "--checkpoint_dir", type=str, default="../checkpoints/sam2.1_hiera_large.pt"
+    )
+    parser.add_argument(
+        "--model_cfg", type=str, default="configs/sam2.1/sam2.1_hiera_l.yaml"
+    )
     parser.add_argument("--root_dir", type=str, required=True)
     parser.add_argument("--vid_name", type=str, default="videos")
     parser.add_argument("--img_name", type=str, default="images")
@@ -540,12 +552,15 @@ if __name__ == "__main__":
 
     # device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    print("Args before launch")
+    print(args)
+
     demo = make_demo(
         args.checkpoint_dir,
         args.model_cfg,
         args.root_dir,
         args.vid_name,
         args.img_name,
-        args.mask_name
+        args.mask_name,
     )
     demo.launch(server_port=args.port)
